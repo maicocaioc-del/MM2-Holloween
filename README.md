@@ -34,7 +34,7 @@ local MAX_COINS = 50  -- tamanho do saco, usado se o remote não informar o máx
 local DEBUG = false   -- true = imprime no console tudo que o CoinCollected manda
 
 local Bag = { count = 0, max = MAX_COINS, full = false }
-local onBagFull, onBagReset -- definidos no fim do arquivo
+local onBagFull, onBagReset, onCoinPicked -- definidos mais abaixo
 
 local function setBag(count, max)
 	Bag.count = count
@@ -67,6 +67,7 @@ local function onCoinCollected(...)
 	else
 		setBag(Bag.count + 1)
 	end
+	if onCoinPicked then onCoinPicked() end -- marca a moeda coletada como usada
 end
 
 -- Novo round -> saco zera
@@ -116,25 +117,79 @@ local currentChar, savedCF = nil, nil
 local coinContainer
 local skipped = setmetatable({}, { __mode = "k" })
 local noclipped = {}
+local coinInfo = {} -- [moeda] = { t0 = transparência inicial, touch0 = CanTouch inicial }
 
-local function getContainer()
-	if coinContainer and coinContainer.Parent then return coinContainer end
-	coinContainer = nil
-	for _, d in ipairs(workspace:GetDescendants()) do
-		if d.Name == "CoinContainer" then coinContainer = d break end
+local function trackCoin(d)
+	if COIN_NAMES[d.Name] and d:IsA("BasePart") and not coinInfo[d] then
+		coinInfo[d] = { t0 = d.Transparency, touch0 = d.CanTouch }
 	end
-	return coinContainer
 end
+
+-- A moeda ainda vale a pena? Existe, está no mapa atual, não foi coletada nem escondida.
+local function coinValid(c)
+	local info = coinInfo[c]
+	if not info or skipped[c] or not c.Parent or not c:IsDescendantOf(workspace) then return false end
+	if coinContainer and not c:IsDescendantOf(coinContainer) then return false end
+	if c.Transparency > info.t0 + 0.5 then return false end -- ficou invisível
+	if info.touch0 and not c.CanTouch then return false end   -- não encosta mais
+	return true
+end
+
+-- Zera tudo e lê as moedas do CoinContainer (ou do workspace se não houver container)
+local function rescanCoins()
+	for k in pairs(skipped) do skipped[k] = nil end
+	for k in pairs(coinInfo) do coinInfo[k] = nil end
+	target = nil
+	for _, d in ipairs((coinContainer or workspace):GetDescendants()) do trackCoin(d) end
+end
+
+for _, d in ipairs(workspace:GetDescendants()) do
+	if d.Name == "CoinContainer" then coinContainer = d break end
+end
+rescanCoins()
+
+-- Observa o workspace: novo CoinContainer = novo round; moeda nova entra; moeda removida sai
+workspace.DescendantAdded:Connect(function(d)
+	if d.Name == "CoinContainer" then
+		coinContainer = d
+		task.defer(rescanCoins) -- espera as moedas serem colocadas dentro dele
+	elseif COIN_NAMES[d.Name] then
+		trackCoin(d)
+	end
+end)
+workspace.DescendantRemoving:Connect(function(d)
+	coinInfo[d] = nil
+	if d == target then target = nil end
+	if d == coinContainer then coinContainer = nil end
+end)
 
 local function pickCoin(from)
 	local best, bestDist = nil, math.huge
-	for _, d in ipairs((getContainer() or workspace):GetDescendants()) do
-		if COIN_NAMES[d.Name] and d:IsA("BasePart") and not skipped[d] then
-			local dist = (d.Position - from).Magnitude
-			if dist < bestDist then best, bestDist = d, dist end
+	for c in pairs(coinInfo) do
+		if coinValid(c) then
+			local dist = (c.Position - from).Magnitude
+			if dist < bestDist then best, bestDist = c, dist end
 		end
 	end
 	return best
+end
+
+-- O jogo avisou que uma moeda foi coletada: marca a mais próxima do boneco como usada
+onCoinPicked = function()
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	local best, bestDist = nil, 8
+	for c in pairs(coinInfo) do
+		if not skipped[c] and c.Parent then
+			local d = (c.Position - root.Position).Magnitude
+			if d < bestDist then best, bestDist = c, d end
+		end
+	end
+	if best then
+		skipped[best] = true
+		if best == target then target = nil end
+	end
 end
 
 local function setAnimations(char, hum, enabled)
@@ -207,7 +262,7 @@ local function farmStep(dt)
 		noclipped = {}
 	end
 
-	if target and not target.Parent then target = nil end
+	if target and not coinValid(target) then target = nil end
 	if not target then
 		if os.clock() < nextScan then return end
 		target = pickCoin(root.Position)
@@ -533,50 +588,4 @@ end)
 -- Arrastar janela --------------------------------------------------------------
 header.InputBegan:Connect(function(i)
 	if not isPress(i) then return end
-	local dragStart, startPos = i.Position, main.Position
-	beginDrag(i, function(m)
-		local d = m.Position - dragStart
-		main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-			startPos.Y.Scale, startPos.Y.Offset + d.Y)
-	end)
-end)
-
--- Ações do saco cheio ------------------------------------------------------------
---   Auto Farm   : pausa (boneco volta ao normal) e retoma quando o saco zera (novo round)
---   XP Farm     : teleporta pro lobby até o saco zerar (novo round)
---   Auto Respawn: reseta o personagem
-local LOBBY_CFRAME = nil -- se souber a posição do lobby: CFrame.new(x, y, z)
-
-local function lobbyCFrame()
-	if LOBBY_CFRAME then return LOBBY_CFRAME end
-	local lobby = workspace:FindFirstChild("Lobby", true)
-	if not lobby then return nil end
-	for _, d in ipairs(lobby:GetDescendants()) do
-		if d:IsA("SpawnLocation") then return d.CFrame + Vector3.new(0, 4, 0) end
-	end
-	if lobby:IsA("Model") then return lobby:GetPivot() + Vector3.new(0, 6, 0) end
-	if lobby:IsA("BasePart") then return lobby.CFrame + Vector3.new(0, 6, 0) end
-	return nil
-end
-
--- Auto Win: com o saco cheio, pega a Gun (se não tiver) e atira em quem tem a Knife --
-local SHOT_TRIES = 6     -- tentativas de tiro
-local SHOT_DELAY = 1     -- segundos entre tentativas (recarga da arma)
-local winToken = 0       -- muda a cada novo round / nova execução (cancela a anterior)
-
-local function getTool(plr, name)
-	local ch, bp = plr.Character, plr:FindFirstChildOfClass("Backpack")
-	local t = (ch and ch:FindFirstChild(name)) or (bp and bp:FindFirstChild(name))
-	return (t and t:IsA("Tool")) and t or nil
-end
-
-local function myParts()
-	local char = player.Character
-	local root = char and char:FindFirstChild("HumanoidRootPart")
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	if root and hum and hum.Health > 0 then return char, root, hum end
-end
-
-local function findGunDrop(from)
-	local best, bestDist = nil, math.huge
-	for _, d in ipairs(workspace:GetDescendants())
+	loca
